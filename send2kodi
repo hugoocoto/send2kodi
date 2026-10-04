@@ -6,6 +6,7 @@ send2kodi - send URLs, local videos and images to Kodi.
   send2kodi ~/Videos/movie.mkv               # a file on this machine
   send2kodi ~/Pictures/*.jpg                 # images, as a slideshow
   send2kodi -q URL_OR_FILE ...               # append to Kodi's queue
+  send2kodi -q -C                            # queue what's in the clipboard
   send2kodi --bg ~/Videos/movie.mkv          # serve in the background
   send2kodi --stop | --pause
 
@@ -42,7 +43,9 @@ import mimetypes
 import os
 import re
 import secrets
+import shutil
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -276,6 +279,34 @@ def is_image(target):
     return (mimetypes.guess_type(target)[0] or "").startswith("image/")
 
 
+def clipboard():
+    """Targets in the clipboard, one per line; file:// URIs become paths."""
+    if os.environ.get("WAYLAND_DISPLAY"):
+        tools = [["wl-paste", "--no-newline"]]
+    else:
+        tools = []
+    tools += [["xclip", "-o", "-selection", "clipboard"], ["xsel", "-ob"]]
+    for cmd in tools:
+        if shutil.which(cmd[0]):
+            break
+    else:
+        die("reading the clipboard needs wl-clipboard (Wayland), "
+            "or xclip or xsel (X11)")
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        die(f"{cmd[0]}: {r.stderr.strip() or 'cannot read the clipboard'}")
+    targets = []
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if line.lower().startswith("file://"):
+            line = urllib.parse.unquote(urllib.parse.urlparse(line).path)
+        if line and not line.startswith("#"):  # text/uri-list comments
+            targets.append(line)
+    if not targets:
+        die("the clipboard is empty")
+    return targets
+
+
 def to_kodi_file(target, server):
     if os.path.isfile(target):
         return server.url_for(target)
@@ -388,6 +419,9 @@ def main():
                    help="URLs (YouTube, or anything yt-dlp supports) or local files")
     p.add_argument("-q", "--queue", action="store_true",
                    help="append to Kodi's queue instead of playing now")
+    p.add_argument("-C", "--clipboard", action="store_true",
+                   help="also send the URLs or file paths in the clipboard, "
+                        "one per line")
     p.add_argument("--bg", action="store_true", default=None,
                    help="serve local files from a background process")
     p.add_argument("--fg", dest="bg", action="store_false",
@@ -420,6 +454,8 @@ def main():
             method = "Player.Stop" if args.stop else "Player.PlayPause"
             rpc(method, {"playerid": player["playerid"]})
         return
+    if args.clipboard:
+        args.targets += clipboard()
     if not args.targets:
         p.error("nothing to send")
     images = [is_image(t) for t in args.targets]

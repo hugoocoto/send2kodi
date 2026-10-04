@@ -60,10 +60,13 @@ send2kodi --host 192.168.1.10 https://youtu.be/jNQXAC9IVRw
 ```sh
 send2kodi URL_OR_FILE ...           # play now, replacing whatever is playing
 send2kodi -q URL_OR_FILE ...        # add to the end of Kodi's queue
+send2kodi -q -C                     # queue the URLs/paths in the clipboard
 send2kodi --bg ~/Videos/film.mkv    # serve the file in the background
 send2kodi --pause                   # toggle pause
 send2kodi --stop
 ```
+
+`-C` reads the clipboard with `wl-paste` on Wayland, or `xclip`/`xsel` on X11, one URL or path per line. Files copied in a file manager work too.
 
 When playing now, `send2kodi` waits until Kodi really starts playing and exits with an error if it has not within a minute. Kodi accepts any link immediately, even one that will never play, so without this a bad link would fail silently on the TV.
 
