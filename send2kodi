@@ -110,11 +110,13 @@ SUBTITLE_EXTS = ".ass .idx .smi .srt .ssa .sub .sup .vtt".split()
 MEDIA = {**dict.fromkeys(VIDEO_EXTS, "video"),
          **dict.fromkeys(AUDIO_EXTS, "audio"),
          **dict.fromkeys(IMAGE_EXTS, "image")}
+NOUNS = {"video": "video", "audio": "song", "image": "picture"}
 # Content types of streams that don't say video/ or audio/.
 STREAM_TYPES = {"application/vnd.apple.mpegurl", "application/x-mpegurl",
                 "application/dash+xml", "application/ogg"}
 # Folders next to a video where Kodi looks for its subtitles too.
 SUBTITLE_DIRS = {"subs", "subtitles", "sub", "subtitle", "vobsub", "vobsubs"}
+URL = re.compile(r"[a-z][a-z0-9+.-]*://", re.I)
 
 cfg = dict(DEFAULTS)
 
@@ -122,7 +124,7 @@ print = functools.partial(print, flush=True)  # progress shows up when piped
 
 
 def die(msg, code=1):
-    print(f"send2kodi: {msg}", file=sys.stderr)
+    warn(msg)
     sys.exit(code)
 
 
@@ -142,8 +144,7 @@ def read_config(path):
                 key, sep, value = line.partition("=")
                 key, value = key.strip().removeprefix("export "), value.strip()
                 if not sep or key not in DEFAULTS:
-                    print(f"send2kodi: {path}:{n}: ignoring '{line}'",
-                          file=sys.stderr)
+                    warn(f"{path}:{n}: ignoring '{line}'")
                     continue
                 if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
                     value = value[1:-1]
@@ -199,10 +200,11 @@ def rpc(method, params=None):
 
 
 @functools.cache
-def has_addon(addonid):
+def addons():
+    """The ids of the plugin add-ons enabled in Kodi."""
     result = rpc("Addons.GetAddons", {"type": "xbmc.python.pluginsource",
                                       "enabled": True})
-    return any(a["addonid"] == addonid for a in result.get("addons", []))
+    return {a["addonid"] for a in result.get("addons", [])}
 
 
 # ------------------------------------------------------------ local files --
@@ -285,20 +287,12 @@ class FileHandler(BaseHTTPRequestHandler):
         if m:
             self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
         self.end_headers()
-        if not body:
-            return
-        try:
+        if body:
             with open(path, "rb") as f:
-                f.seek(start)
-                left = end - start + 1
-                while left > 0:
-                    chunk = f.read(min(left, 1 << 16))
-                    if not chunk:
-                        break
-                    self.wfile.write(chunk)
-                    left -= len(chunk)
-        except (BrokenPipeError, ConnectionResetError):
-            pass  # Kodi drops connections whenever it seeks
+                try:
+                    self.connection.sendfile(f, start, end - start + 1)
+                except ConnectionError:
+                    pass  # Kodi drops connections whenever it seeks
 
     def send_listing(self, files, body):
         """Kodi takes a link for a file when its text is its decoded href."""
@@ -322,18 +316,21 @@ class Server:
         self.token = secrets.token_urlsafe(16)
         self.extras = 0  # subtitles served along with videos
 
+    def start(self):
+        ip = local_ip()
+        try:
+            self.httpd = ThreadingHTTPServer(
+                (ip, int(cfg["SERVE_PORT"])), FileHandler)
+        except OSError:  # port taken (e.g. another send2kodi): pick any
+            self.httpd = ThreadingHTTPServer((ip, 0), FileHandler)
+        self.httpd.daemon_threads = True
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+        self.prefix = f"http://{ip}:{self.httpd.server_port}/{self.token}/"
+
     def folder(self, files):
         """Serve {name: path} as a folder of its own; returns its URL."""
         if self.httpd is None:
-            ip = local_ip()
-            try:
-                self.httpd = ThreadingHTTPServer(
-                    (ip, int(cfg["SERVE_PORT"])), FileHandler)
-            except OSError:  # port taken (e.g. another send2kodi): pick any
-                self.httpd = ThreadingHTTPServer((ip, 0), FileHandler)
-            self.httpd.daemon_threads = True
-            threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
-            self.prefix = f"http://{ip}:{self.httpd.server_port}/{self.token}/"
+            self.start()
         n = len(FileHandler.folders)
         FileHandler.folders[f"/{self.token}/{n}/"] = {
             name: os.path.abspath(path) for name, path in files.items()}
@@ -363,17 +360,20 @@ class Server:
 # ---------------------------------------------------------------- targets --
 
 def is_url(target):
-    return re.match(r"^https?://", target, re.I) is not None
+    """An http(s) link, which send2kodi looks into."""
+    return re.match(r"https?://", target, re.I) is not None
 
 
 def is_kodi_url(target):
-    """Other URLs (smb://, nfs://, rtsp://, plugin://...) Kodi opens itself."""
-    return (re.match(r"^[a-z][a-z0-9+.-]*://", target, re.I) is not None
-            and not is_url(target))
+    """Any other URL (smb://, nfs://, rtsp://, plugin://...): Kodi opens it."""
+    return URL.match(target) is not None and not is_url(target)
 
 
-def extension(path):
-    return os.path.splitext(path)[1].lower()
+def extension(target):
+    """Of a file name, or of the path in a URL."""
+    if URL.match(target):
+        target = urllib.parse.urlparse(target).path
+    return os.path.splitext(target)[1].lower()
 
 
 def natural(text):
@@ -382,8 +382,8 @@ def natural(text):
             for i, part in enumerate(re.split(r"(\d+)", text))]
 
 
-def plural(n, what):
-    return f"{n} {what}{'' if n == 1 else 's'}"
+def plural(n, noun):
+    return f"{n} {noun}{'' if n == 1 else 's'}"
 
 
 def lines(text):
@@ -400,19 +400,17 @@ def media_in(folder):
     for root, dirs, files in os.walk(folder):
         dirs[:] = [d for d in dirs if not d.startswith(".")]
         for name in files:
-            if not name.startswith(".") and extension(name) in MEDIA:
-                found[MEDIA[extension(name)]].append(os.path.join(root, name))
-    sent = found["video"] + found["audio"] or found["image"]
+            kind = MEDIA.get(extension(name))
+            if kind and not name.startswith("."):
+                found[kind].append(os.path.join(root, name))
+    kinds = [k for k in ("video", "audio") if found[k]] or ["image"]
+    sent = sorted((path for k in kinds for path in found[k]),
+                  key=lambda path: natural(os.path.relpath(path, folder)))
     if not sent:
         die(f"no videos, songs or pictures in {folder}")
-    sent.sort(key=lambda path: natural(os.path.relpath(path, folder)))
-    if found["video"] or found["audio"]:
-        what = [plural(len(found[k]), w) for k, w in
-                (("video", "video"), ("audio", "song")) if found[k]]
-        if found["image"]:
-            what.append(f"leaving out {plural(len(found['image']), 'picture')}")
-    else:
-        what = [plural(len(sent), "picture")]
+    what = [plural(len(found[k]), NOUNS[k]) for k in kinds]
+    if kinds != ["image"] and found["image"]:
+        what.append(f"leaving out {plural(len(found['image']), 'picture')}")
     print(f"{folder}: {', '.join(what)}")
     return sent
 
@@ -427,11 +425,11 @@ def expand(targets):
             continue
         if t.lower().startswith("file://"):
             t = urllib.parse.unquote(urllib.parse.urlparse(t).path)
-        elif not is_url(t) and not is_kodi_url(t):
+        elif not URL.match(t):
             t = os.path.expanduser(t)
         if os.path.isdir(t):
             out += media_in(t)
-        elif os.path.isfile(t) or is_url(t) or is_kodi_url(t):
+        elif os.path.isfile(t) or URL.match(t):
             out.append(t)
         else:
             die(f"not a URL, file or folder: {t}")
@@ -479,6 +477,8 @@ def start_time(text):
 
 def youtube_start(url):
     """The time a YouTube link starts at (?t=90, ?t=1m30s, #t=90), or 0."""
+    if not youtube_id(url):
+        return 0
     u = urllib.parse.urlparse(url)
     params = {**urllib.parse.parse_qs(u.fragment), **urllib.parse.parse_qs(u.query)}
     return seconds((params.get("t") or params.get("start") or [""])[0]) or 0
@@ -495,14 +495,19 @@ def tempdir():
     return path
 
 
+def fetch(url, timeout, method="GET", **headers):
+    """A URL opened as a browser would."""
+    return urllib.request.urlopen(urllib.request.Request(
+        url, method=method, headers={"User-Agent": USER_AGENT, **headers}),
+        timeout=timeout)
+
+
 @functools.cache
 def remote_type(url):
     """The Content-Type a URL serves, or "" if it can't be found out."""
     for method, headers in (("HEAD", {}), ("GET", {"Range": "bytes=0-0"})):
-        req = urllib.request.Request(url, method=method, headers={
-            "User-Agent": USER_AGENT, **headers})
         try:
-            with urllib.request.urlopen(req, timeout=10) as r:
+            with fetch(url, 10, method, **headers) as r:
                 return r.headers.get_content_type()
         except (OSError, ValueError):
             continue  # some servers refuse HEAD
@@ -514,18 +519,16 @@ def kind_of(target):
     which is what Kodi goes by, or for a link whose extension says nothing
     (e.g. an image proxy's /iu/?u=...), by what it serves. None for a page
     an add-on has to resolve (YouTube, or anything yt-dlp knows)."""
+    ext = extension(target)
+    if ext in MEDIA:
+        return MEDIA[ext]
+    if ext in STREAM_EXTS:
+        return "video"
     if not is_url(target):  # a local file, or smb://, plugin://...
-        ext = extension(urllib.parse.urlparse(target).path
-                        if is_kodi_url(target) else target)
-        if ext in MEDIA:
-            return MEDIA[ext]
         guess = (mimetypes.guess_type(target)[0] or "").partition("/")[0]
         return guess if guess in ("audio", "image") else "video"
     if youtube_id(target):
         return None
-    ext = extension(urllib.parse.urlparse(target).path)
-    if ext in MEDIA or ext in STREAM_EXTS:
-        return MEDIA.get(ext, "video")
     served = remote_type(target)
     if served in STREAM_TYPES:
         return "video"
@@ -533,25 +536,22 @@ def kind_of(target):
     return served if served in ("video", "audio", "image") else None
 
 
-def route(target, kind, slideshow):
+def route(target, kind):
     """How Kodi gets a target: "serve" (a file here), "download" (a picture
-    that has to be served from here too), "direct" (a link it plays itself),
-    or "youtube" / "sendtokodi" (a page that add-on resolves)."""
+    it can't fetch as it is, served from here), "direct" (a link it plays
+    itself), or "youtube" / "sendtokodi" (a page that add-on resolves)."""
     if os.path.isfile(target):
         return "serve"
     if is_kodi_url(target):
         return "direct"
-    if kind == "image":
-        # Kodi shows pictures it recognises by extension; a slideshow is a
-        # folder of ours.
-        known = extension(urllib.parse.urlparse(target).path) in IMAGE_EXTS
-        return "direct" if known and not slideshow else "download"
+    if kind == "image":  # Kodi shows pictures it recognises by extension
+        return "direct" if extension(target) in IMAGE_EXTS else "download"
     if kind:
         return "direct"
     if (youtube_id(target) and cfg["YOUTUBE"] != "ytdlp"
-            and has_addon(YOUTUBE_ADDON)):
+            and YOUTUBE_ADDON in addons()):
         return "youtube"
-    if not has_addon(SENDTOKODI_ADDON):
+    if SENDTOKODI_ADDON not in addons():
         die(f"Kodi needs the SendToKodi add-on ({SENDTOKODI_ADDON}) to play "
             f"{target}.\n  See https://github.com/firsttris/plugin.video.sendtokodi")
     return "sendtokodi"
@@ -581,9 +581,8 @@ def subtitles_for(video):
 
 def download_image(url):
     """A local copy, named with the right extension so Kodi knows it."""
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     try:
-        with urllib.request.urlopen(req, timeout=30) as r:
+        with fetch(url, 30) as r:
             ext = mimetypes.guess_extension(r.headers.get_content_type()) or ".jpg"
             path = os.path.join(tempdir(), f"image{len(os.listdir(tempdir()))}{ext}")
             with open(path, "wb") as f:
@@ -683,6 +682,47 @@ def playing(player):
     return item["item"].get("file", "")
 
 
+def millis(t):
+    """A JSON-RPC time, in milliseconds."""
+    return ((t["hours"] * 60 + t["minutes"]) * 60 + t["seconds"]) * 1000 + t["milliseconds"]
+
+
+def open_slideshow(server, paths):
+    """Show pictures as a folder of ours, which Kodi reads as it is; added to
+    a slideshow one by one, those it can't read EXIF data from (PNGs, ...)
+    are dropped. Returns the folder's URL."""
+    width = len(str(len(paths)))
+    # Numbered, as Kodi sorts a slideshow by name.
+    folder = server.folder({f"{n:0{width}} {os.path.basename(path)}": path
+                            for n, path in enumerate(paths, 1)})
+    rpc("Player.Open", {"item": {"path": folder, "recursive": False},
+                        "options": {"shuffled": False}})
+    return folder
+
+
+def enqueue(files, playlist, play):
+    """Add files to a Kodi playlist; to play them now, in place of what it has."""
+    if play:
+        # Whatever is playing goes first: it would pass for ours while an
+        # add-on is still resolving ours.
+        for player in rpc("Player.GetActivePlayers"):
+            if player["type"] != "picture":
+                rpc("Player.Stop", {"playerid": player["playerid"]})
+        rpc("Playlist.Clear", {"playlistid": playlist})
+    # Kodi adds pictures there and then, dropping some; videos and songs a
+    # moment later, all of them.
+    before = playlist_size(playlist) if playlist == PICTURE_PLAYLIST else 0
+    rpc("Playlist.Add", {"playlistid": playlist,
+                         "item": [{"file": f} for f in files]})
+    if playlist == PICTURE_PLAYLIST:
+        added = playlist_size(playlist) - before
+        if added < len(files):
+            die(f"Kodi accepted only {added} of {len(files)} picture(s). "
+                "It drops PNGs added to a slideshow; send them without -q.")
+    if play:
+        rpc("Player.Open", {"item": {"playlistid": playlist, "position": 0}})
+
+
 def wait_for_start(playlist, ours):
     """The id of the player once Kodi is playing what we sent, None on timeout.
 
@@ -702,10 +742,8 @@ def wait_for_start(playlist, ours):
                     continue
                 props = rpc("Player.GetProperties", {
                     "playerid": pid, "properties": ["playlistid", "position", "time"]})
-                t = props["time"]  # below 0 until the first frame
                 if (props["playlistid"] == playlist and props["position"] >= 0
-                        and (t["hours"], t["minutes"], t["seconds"], t["milliseconds"])
-                        > (0, 0, 0, 0)):
+                        and millis(props["time"]) > 0):  # below 0 till the 1st frame
                     return pid
         except KodiError:
             pass  # e.g. the player stopped between the two calls
@@ -732,7 +770,7 @@ def add_subtitle(player, path, server):
     server.wait_fetched(url)  # Kodi reads it once, but not right away
 
 
-def wait_until_done(ours, playlist, started):
+def wait_until_done(playlist, ours, started):
     """Serve until playback has ended, or our files have left the queue.
 
     Queued files may wait a long time for their turn, so idle time alone
@@ -749,30 +787,26 @@ def wait_until_done(ours, playlist, started):
             time.sleep(5)
             try:
                 players = rpc("Player.GetActivePlayers")
-            except (KodiError, Unreachable):
-                if time.monotonic() - answered > 120:
-                    return
-                continue
-            answered = time.monotonic()
-            if players:
-                started, idle = True, 0
-            elif started:
-                idle += 1
-                if idle >= 2:
-                    return
-                continue
-            try:
-                if started and playlist == PICTURE_PLAYLIST:
-                    viewer = [p for p in players if p["type"] == "picture"]
-                    if not viewer or not ours(playing(viewer[0]["playerid"])):
+                answered = time.monotonic()
+                if players:
+                    started, idle = True, 0
+                elif started:
+                    idle += 1
+                    if idle == 2:
                         return
                     continue
-                items = rpc("Playlist.GetItems", {"playlistid": playlist,
-                                                  "properties": ["file"]})
-                if not any(ours(i.get("file", "")) for i in items.get("items", [])):
+                if started and playlist == PICTURE_PLAYLIST:
+                    viewer = [p["playerid"] for p in players if p["type"] == "picture"]
+                    if not viewer or not ours(playing(viewer[0])):
+                        return
+                else:
+                    items = rpc("Playlist.GetItems", {"playlistid": playlist,
+                                                      "properties": ["file"]})
+                    if not any(ours(i.get("file", "")) for i in items.get("items", [])):
+                        return
+            except (KodiError, Unreachable):  # a player gone meanwhile; Wi-Fi
+                if time.monotonic() - answered > 120:
                     return
-            except (KodiError, Unreachable):
-                pass  # e.g. the viewer closed between the two calls
     except KeyboardInterrupt:
         pass
 
@@ -816,7 +850,7 @@ def detached():
 
 # ------------------------------------------------------------------- main --
 
-def main():
+def parser():
     p = argparse.ArgumentParser(
         description="Send URLs, local files and folders to Kodi.",
         epilog=f"Settings file: {CONFIG_PATH}. Every setting there "
@@ -850,6 +884,11 @@ def main():
     p.add_argument("-c", "--config", default=CONFIG_PATH,
                    help="settings file (default: %(default)s)")
     p.add_argument("--version", action="version", version=f"send2kodi {VERSION}")
+    return p
+
+
+def main():
+    p = parser()
     args = p.parse_args()
     # Exit normally on kill too, so temporary files are cleaned up.
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
@@ -889,13 +928,15 @@ def main():
             p["type"] == "picture" for p in rpc("Player.GetActivePlayers")):
         die("Kodi can't add pictures to a slideshow that is already showing. "
             "Leave it, or send them without -q to replace it.")
-    # Several pictures are shown as a folder of ours, which Kodi reads as it
-    # is; added to a slideshow one by one, those it can't read EXIF data from
-    # (PNGs, ...) are dropped.
+    # Several pictures are shown as a folder of ours, unless some are on
+    # smb:// and the like, which can't go in it.
     slideshow = (playlist == PICTURE_PLAYLIST and len(targets) > 1
                  and not args.queue and not any(map(is_kodi_url, targets)))
-    routes = [route(t, k, slideshow) for t, k in zip(targets, kinds)]
-    served = any(how in ("serve", "download") for how in routes)
+    routes = [route(t, k) for t, k in zip(targets, kinds)]
+    served = slideshow or any(how in ("serve", "download") for how in routes)
+    starts = [youtube_start(t) for t in targets]  # where each item starts
+    if args.start is not None:
+        starts[0] = args.start
 
     bg = args.bg if args.bg is not None else truthy(cfg["BACKGROUND"])
     bg = bg and (served or args.sub is not None)
@@ -903,48 +944,18 @@ def main():
         background()
         print(f"Serving local file(s) in the background (pid {os.getpid()}).")
 
-    def start_of(i, target):
-        """Where an item starts: --start for the first, else its link's ?t=."""
-        if i == 0 and args.start is not None:
-            return args.start
-        return youtube_start(target) if youtube_id(target) else 0
-
     server = Server()
     if slideshow:
-        paths = [t if how == "serve" else download_image(t)
-                 for t, how in zip(targets, routes)]
-        # Numbered, as Kodi sorts a slideshow by name.
-        width = len(str(len(paths)))
-        files = [server.folder({f"{n:0{width}} {os.path.basename(path)}": path
-                                for n, path in enumerate(paths, 1)})]
-        rpc("Player.Open", {"item": {"path": files[0], "recursive": False},
-                            "options": {"shuffled": False}})
+        files = [open_slideshow(server, [t if how == "serve" else download_image(t)
+                                         for t, how in zip(targets, routes)])]
     else:
-        files = [to_kodi_file(t, k, how, server, start_of(i, t))
-                 for i, (t, k, how) in enumerate(zip(targets, kinds, routes))]
+        files = [to_kodi_file(t, k, how, server, s)
+                 for t, k, how, s in zip(targets, kinds, routes, starts)]
         if playlist == PICTURE_PLAYLIST and len(files) == 1 and not args.queue:
             # Straight to the viewer: Kodi drops PNGs added to a slideshow.
             rpc("Player.Open", {"item": {"file": files[0]}})
         else:
-            if not args.queue:
-                # Whatever is playing goes first: it would pass for ours
-                # while an add-on is still resolving ours.
-                for player in rpc("Player.GetActivePlayers"):
-                    if player["type"] != "picture":
-                        rpc("Player.Stop", {"playerid": player["playerid"]})
-                rpc("Playlist.Clear", {"playlistid": playlist})
-            # Kodi adds pictures there and then, dropping some; videos and
-            # songs a moment later, all of them.
-            before = playlist_size(playlist) if playlist == PICTURE_PLAYLIST else 0
-            rpc("Playlist.Add", {"playlistid": playlist,
-                                 "item": [{"file": f} for f in files]})
-            if playlist == PICTURE_PLAYLIST:
-                added = playlist_size(playlist) - before
-                if added < len(files):
-                    die(f"Kodi accepted only {added} of {len(files)} picture(s). "
-                        "It drops PNGs added to a slideshow; send them without -q.")
-            if not args.queue:
-                rpc("Player.Open", {"item": {"playlistid": playlist, "position": 0}})
+            enqueue(files, playlist, play=not args.queue)
     sent = set(files)
 
     def ours(file):
@@ -962,15 +973,14 @@ def main():
             die(f"nothing started playing after {cfg['START_TIMEOUT']}s; "
                 "the link may be unsupported or failed to resolve")
         print("Playing.")
-        start = start_of(0, targets[0])
-        if start and routes[0] != "youtube":  # that add-on seeks by itself
-            seek(player, start)
+        if starts[0] and routes[0] != "youtube":  # that add-on seeks by itself
+            seek(player, starts[0])
         if args.sub:
             add_subtitle(player, args.sub, server)
     if bg:
         detached()
     if served:
-        wait_until_done(ours, playlist, started=not args.queue)
+        wait_until_done(playlist, ours, started=not args.queue)
 
 
 if __name__ == "__main__":
