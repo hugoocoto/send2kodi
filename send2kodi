@@ -1,0 +1,429 @@
+#!/usr/bin/env python3
+"""
+send2kodi - send URLs and local video files to Kodi.
+
+  send2kodi https://youtu.be/jNQXAC9IVRw     # YouTube, or anything yt-dlp knows
+  send2kodi ~/Videos/movie.mkv               # a file on this machine
+  send2kodi -q URL_OR_FILE ...               # append to Kodi's queue
+  send2kodi --bg ~/Videos/movie.mkv          # serve in the background
+  send2kodi --stop | --pause
+
+Everything goes through Kodi's JSON-RPC API; nothing has to be installed on
+this machine beyond Python 3.
+
+YouTube videos are handed to the YouTube add-on (plugin.video.youtube), which
+starts fastest. Other URLs, and YouTube when that add-on is missing or
+YOUTUBE=ytdlp, go through the SendToKodi add-on (plugin.video.sendtokodi),
+which resolves them with yt-dlp on the Kodi side.
+
+Local files are served by a small HTTP server that exposes only the files
+given on the command line, under random unguessable paths, answers only the
+Kodi box, and exits once Kodi has played them or they leave the queue (or on
+Ctrl-C). With --bg it detaches once playback has started, freeing the
+terminal.
+
+Settings come from, in increasing priority: built-in defaults, the config
+file (~/.config/send2kodi/config), the environment, and command-line flags.
+
+https://github.com/hugoocoto/send2kodi
+"""
+
+import argparse
+import base64
+import functools
+import json
+import os
+import re
+import secrets
+import socket
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+VERSION = "0.1.0"
+
+CONFIG_PATH = os.path.join(
+    os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+    "send2kodi", "config")
+
+# Every setting, with its default. Each one can be set in the config file or
+# as an environment variable of the same name.
+DEFAULTS = {
+    "KODI_HOST": "",          # address or hostname of the Kodi box (required)
+    "KODI_PORT": "8080",      # Kodi's web server port
+    "KODI_USER": "kodi",      # web server login, if one is set in Kodi
+    "KODI_PASS": "",
+    "SERVE_IP": "",           # address Kodi reaches us on (default: autodetect)
+    "SERVE_PORT": "8765",     # port for local files (falls back to any free one)
+    "START_TIMEOUT": "60",    # seconds to wait for playback to start
+    "YOUTUBE": "addon",       # addon = YouTube add-on, ytdlp = SendToKodi
+    "BACKGROUND": "no",       # yes = always behave as if --bg was given
+}
+
+VIDEO_PLAYLIST = 1
+YOUTUBE_ADDON = "plugin.video.youtube"
+SENDTOKODI_ADDON = "plugin.video.sendtokodi"
+
+cfg = dict(DEFAULTS)
+
+print = functools.partial(print, flush=True)  # progress shows up when piped
+
+
+def die(msg, code=1):
+    print(f"send2kodi: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def read_config(path):
+    """KEY=VALUE lines, shell style: comments, blank lines, optional quotes."""
+    values = {}
+    try:
+        with open(path) as f:
+            for n, line in enumerate(f, 1):
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                key, sep, value = line.partition("=")
+                key, value = key.strip().removeprefix("export "), value.strip()
+                if not sep or key not in DEFAULTS:
+                    print(f"send2kodi: {path}:{n}: ignoring '{line}'",
+                          file=sys.stderr)
+                    continue
+                if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+                    value = value[1:-1]
+                values[key] = value
+    except FileNotFoundError:
+        pass
+    return values
+
+
+def truthy(value):
+    return value.lower() in ("1", "yes", "true", "on")
+
+
+# ------------------------------------------------------------------- kodi --
+
+def rpc(method, params=None):
+    body = {"jsonrpc": "2.0", "id": 1, "method": method}
+    if params is not None:
+        body["params"] = params
+    req = urllib.request.Request(
+        f"http://{cfg['KODI_HOST']}:{cfg['KODI_PORT']}/jsonrpc",
+        data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    if cfg["KODI_USER"] or cfg["KODI_PASS"]:
+        token = base64.b64encode(
+            f"{cfg['KODI_USER']}:{cfg['KODI_PASS']}".encode()).decode()
+        req.add_header("Authorization", f"Basic {token}")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            resp = json.load(r)
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            die(f"Kodi at {cfg['KODI_HOST']} rejected the login; "
+                f"set KODI_USER and KODI_PASS in {CONFIG_PATH}")
+        die(f"Kodi at {cfg['KODI_HOST']}: HTTP {e.code} {e.reason}")
+    except OSError as e:
+        die(f"cannot reach Kodi at {cfg['KODI_HOST']}:{cfg['KODI_PORT']} ({e}).\n"
+            "  Is it on, and is Settings > Services > Control > "
+            "'Allow remote control via HTTP' enabled?")
+    if "error" in resp:
+        die(f"{method} failed: {resp['error']}")
+    return resp["result"]
+
+
+@functools.cache
+def has_addon(addonid):
+    result = rpc("Addons.GetAddons", {"type": "xbmc.python.pluginsource",
+                                      "enabled": True})
+    return any(a["addonid"] == addonid for a in result.get("addons", []))
+
+
+# ------------------------------------------------------------ local files --
+
+@functools.cache
+def kodi_ip():
+    """KODI_HOST may be a hostname; the server checks clients by address."""
+    try:
+        return socket.gethostbyname(cfg["KODI_HOST"])
+    except OSError as e:
+        die(f"cannot resolve {cfg['KODI_HOST']}: {e}")
+
+
+def local_ip():
+    """The address of the interface that routes to Kodi."""
+    if cfg["SERVE_IP"]:
+        return cfg["SERVE_IP"]
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.connect((kodi_ip(), int(cfg["KODI_PORT"])))
+        return s.getsockname()[0]
+
+
+class FileHandler(BaseHTTPRequestHandler):
+    """Serves the registered files only, to Kodi only, with Range support."""
+
+    files = {}  # "/<token>/<n>/<name>" -> absolute path
+
+    def log_message(self, fmt, *args):
+        pass
+
+    def do_HEAD(self):
+        self.serve(body=False)
+
+    def do_GET(self):
+        self.serve(body=True)
+
+    def serve(self, body):
+        path = self.files.get(urllib.parse.unquote(self.path))
+        if self.client_address[0] != kodi_ip() or path is None:
+            self.send_error(404)
+            return
+        size = os.path.getsize(path)
+        start, end = 0, size - 1
+        m = re.fullmatch(r"bytes=(\d*)-(\d*)", self.headers.get("Range", ""))
+        if m and m.group(1):
+            start = int(m.group(1))
+            end = min(int(m.group(2)), size - 1) if m.group(2) else size - 1
+        elif m and m.group(2):  # suffix range: last N bytes
+            start = max(size - int(m.group(2)), 0)
+        if start > end:
+            self.send_response(416)
+            self.send_header("Content-Range", f"bytes */{size}")
+            self.end_headers()
+            return
+        self.send_response(206 if m else 200)
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(end - start + 1))
+        if m:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+        self.end_headers()
+        if not body:
+            return
+        try:
+            with open(path, "rb") as f:
+                f.seek(start)
+                left = end - start + 1
+                while left > 0:
+                    chunk = f.read(min(left, 1 << 16))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    left -= len(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # Kodi drops connections whenever it seeks
+
+
+class Server:
+    """Started on the first local file; one random token per run."""
+
+    def __init__(self):
+        self.httpd = None
+        self.token = secrets.token_urlsafe(16)
+
+    def url_for(self, path):
+        if self.httpd is None:
+            self.ip = local_ip()
+            try:
+                self.httpd = ThreadingHTTPServer(
+                    (self.ip, int(cfg["SERVE_PORT"])), FileHandler)
+            except OSError:  # port taken (e.g. another send2kodi): pick any
+                self.httpd = ThreadingHTTPServer((self.ip, 0), FileHandler)
+            self.httpd.daemon_threads = True
+            threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+        name = f"/{self.token}/{len(FileHandler.files)}/{os.path.basename(path)}"
+        FileHandler.files[name] = os.path.abspath(path)
+        return f"http://{self.ip}:{self.httpd.server_port}{urllib.parse.quote(name)}"
+
+
+# ---------------------------------------------------------------- targets --
+
+def youtube_id(url):
+    """The video ID of a YouTube video URL, or None (playlists included)."""
+    u = urllib.parse.urlparse(url)
+    host = u.netloc.lower().removeprefix("www.").removeprefix("m.")
+    if host == "youtu.be":
+        vid = u.path.strip("/")
+    elif host in ("youtube.com", "music.youtube.com"):
+        m = re.match(r"/(?:shorts|live|embed)/([^/?]+)", u.path)
+        if m:
+            vid = m.group(1)
+        else:
+            vid = urllib.parse.parse_qs(u.query).get("v", [""])[0]
+    else:
+        return None
+    return vid if re.fullmatch(r"[\w-]{11}", vid) else None
+
+
+def to_kodi_file(target, server):
+    if os.path.isfile(target):
+        return server.url_for(target)
+    if not re.match(r"^https?://", target, re.I):
+        die(f"not a URL or existing file: {target}")
+    vid = youtube_id(target)
+    if vid and cfg["YOUTUBE"] != "ytdlp" and has_addon(YOUTUBE_ADDON):
+        return f"plugin://{YOUTUBE_ADDON}/play/?video_id={vid}"
+    if not has_addon(SENDTOKODI_ADDON):
+        die(f"Kodi needs the SendToKodi add-on ({SENDTOKODI_ADDON}) to play "
+            f"{target}.\n  See https://github.com/firsttris/plugin.video.sendtokodi")
+    return f"plugin://{SENDTOKODI_ADDON}/?{target}"
+
+
+# -------------------------------------------------------------- lifecycle --
+
+def wait_for_start():
+    """True once Kodi is playing from the video queue, False on timeout."""
+    deadline = time.monotonic() + int(cfg["START_TIMEOUT"])
+    while time.monotonic() < deadline:
+        time.sleep(2)
+        for player in rpc("Player.GetActivePlayers"):
+            props = rpc("Player.GetProperties", {
+                "playerid": player["playerid"],
+                "properties": ["playlistid", "position", "totaltime"]})
+            if (props["playlistid"] == VIDEO_PLAYLIST and props["position"] >= 0
+                    and any(props["totaltime"].values())):
+                return True
+    return False
+
+
+def wait_until_done(urls):
+    """Serve until playback has started and ended, or our files leave the queue.
+
+    Queued files may wait a long time for their turn, so idle time alone
+    doesn't end the run.
+    """
+    print("Serving local file(s) until playback ends (Ctrl-C to quit)...")
+    started = False
+    try:
+        while True:
+            time.sleep(5)
+            if rpc("Player.GetActivePlayers"):
+                started = True
+            elif started:
+                return
+            items = rpc("Playlist.GetItems", {"playlistid": VIDEO_PLAYLIST,
+                                              "properties": ["file"]})
+            if not urls & {i.get("file") for i in items.get("items", [])}:
+                return
+    except KeyboardInterrupt:
+        pass
+
+
+def background():
+    """Fork a detached child that carries on; the parent relays its startup.
+
+    The child's output goes through a pipe until it calls detached(); the
+    parent prints it and exits 0 then, or with the child's own exit status if
+    it dies first (e.g. playback never started).
+    """
+    r, w = os.pipe()
+    pid = os.fork()
+    if pid:
+        os.close(w)
+        out = b""
+        while chunk := os.read(r, 4096):
+            out += chunk
+        ok = out.endswith(b"\0")
+        sys.stdout.write(out.rstrip(b"\0").decode(errors="replace"))
+        sys.stdout.flush()
+        if ok:
+            os._exit(0)
+        _, status = os.waitpid(pid, 0)
+        os._exit(os.waitstatus_to_exitcode(status))
+    os.close(r)
+    os.setsid()
+    os.dup2(w, 1)
+    os.dup2(w, 2)
+    os.close(w)
+
+
+def detached():
+    """Tell the parent we're up, then drop the pipe (see background())."""
+    os.write(1, b"\0")
+    null = os.open(os.devnull, os.O_RDWR)
+    os.dup2(null, 0)
+    os.dup2(null, 1)
+    os.dup2(null, 2)
+
+
+# ------------------------------------------------------------------- main --
+
+def main():
+    p = argparse.ArgumentParser(
+        description="Send URLs and local video files to Kodi.",
+        epilog=f"Settings file: {CONFIG_PATH}. Every setting there "
+               "(KODI_HOST, KODI_PORT, ...) also works as an environment "
+               "variable.")
+    p.add_argument("targets", nargs="*", metavar="URL_OR_FILE",
+                   help="URLs (YouTube, or anything yt-dlp supports) or local files")
+    p.add_argument("-q", "--queue", action="store_true",
+                   help="append to Kodi's queue instead of playing now")
+    p.add_argument("--bg", action="store_true", default=None,
+                   help="serve local files from a background process")
+    p.add_argument("--fg", dest="bg", action="store_false",
+                   help="stay in the foreground (overrides BACKGROUND=yes)")
+    p.add_argument("--ytdlp", action="store_true",
+                   help="play YouTube links through yt-dlp, not the YouTube add-on")
+    p.add_argument("--stop", action="store_true", help="stop playback")
+    p.add_argument("--pause", action="store_true", help="toggle pause")
+    p.add_argument("-H", "--host", help="Kodi address (KODI_HOST)")
+    p.add_argument("-p", "--port", help="Kodi web server port (KODI_PORT)")
+    p.add_argument("-c", "--config", default=CONFIG_PATH,
+                   help="settings file (default: %(default)s)")
+    p.add_argument("--version", action="version", version=f"send2kodi {VERSION}")
+    args = p.parse_args()
+
+    cfg.update(read_config(args.config))
+    cfg.update({k: os.environ[k] for k in DEFAULTS if k in os.environ})
+    if args.host:
+        cfg["KODI_HOST"] = args.host
+    if args.port:
+        cfg["KODI_PORT"] = args.port
+    if args.ytdlp:
+        cfg["YOUTUBE"] = "ytdlp"
+    if not cfg["KODI_HOST"]:
+        die(f"no Kodi configured. Run the installer, pass --host, or set "
+            f"KODI_HOST in {args.config}")
+
+    if args.stop or args.pause:
+        for player in rpc("Player.GetActivePlayers"):
+            method = "Player.Stop" if args.stop else "Player.PlayPause"
+            rpc(method, {"playerid": player["playerid"]})
+        return
+    if not args.targets:
+        p.error("nothing to send")
+
+    bg = args.bg if args.bg is not None else truthy(cfg["BACKGROUND"])
+    bg = bg and any(os.path.isfile(t) for t in args.targets)
+    if bg:
+        background()
+        print(f"Serving local file(s) in the background (pid {os.getpid()}).")
+
+    server = Server()
+    files = [to_kodi_file(t, server) for t in args.targets]
+    if not args.queue:
+        rpc("Playlist.Clear", {"playlistid": VIDEO_PLAYLIST})
+    for f in files:
+        rpc("Playlist.Add", {"playlistid": VIDEO_PLAYLIST, "item": {"file": f}})
+    if args.queue:
+        print(f"Queued {len(files)} item(s).")
+    else:
+        rpc("Player.Open", {"item": {"playlistid": VIDEO_PLAYLIST, "position": 0}})
+        print(f"Sent {len(files)} item(s) to {cfg['KODI_HOST']}, waiting for playback...")
+        if not wait_for_start():
+            die(f"nothing started playing after {cfg['START_TIMEOUT']}s; "
+                "the link may be unsupported or failed to resolve")
+        print("Playing.")
+    if bg:
+        detached()
+    if server.httpd is not None:
+        wait_until_done({f for f in files if f.startswith("http://")})
+
+
+if __name__ == "__main__":
+    main()
