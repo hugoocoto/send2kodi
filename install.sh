@@ -170,7 +170,7 @@ done
 if (( rc == 0 )); then
   addons=$(rpc "http://$KODI_HOST:$KODI_PORT/jsonrpc" Addons.GetAddons)
   [[ "$addons" == *plugin.video.sendtokodi* ]] ||
-    warn "the SendToKodi add-on is not installed on Kodi; only YouTube links and local files will work. See https://github.com/firsttris/plugin.video.sendtokodi"
+    warn "the SendToKodi add-on is not installed on Kodi; only YouTube links, links to media files and local files will work. See https://github.com/firsttris/plugin.video.sendtokodi"
   [[ "$addons" == *plugin.video.youtube* ]] ||
     warn "the YouTube add-on is not installed on Kodi; YouTube links will go through SendToKodi, which is slower to start."
 fi
@@ -233,6 +233,7 @@ Done. Sending to $KODI_HOST.
 
   send2kodi https://youtu.be/...      play a link
   send2kodi ~/Videos/movie.mkv        play a file from this machine
+  send2kodi ~/Videos/Some.Show/       play a folder, in order
   send2kodi -q URL_OR_FILE ...        add to the queue
   send2kodi --help                    everything else
   Settings    $CFG

@@ -1,11 +1,12 @@
 # send2kodi
 
-Send YouTube links, anything else [yt-dlp](https://github.com/yt-dlp/yt-dlp) can play, and video or image files from your computer to Kodi, from the command line.
+Send YouTube links, anything else [yt-dlp](https://github.com/yt-dlp/yt-dlp) can play, links to media files and streams, and the videos, music and pictures on your computer to Kodi, from the command line.
 
 ```sh
 send2kodi https://youtu.be/jNQXAC9IVRw
 send2kodi ~/Videos/holidays.mkv
-send2kodi ~/Pictures/beach/*.jpg
+send2kodi ~/Videos/Some.Show/
+send2kodi ~/Pictures/beach/
 ```
 
 It talks to Kodi's own JSON-RPC API, so there is nothing to install on the Kodi box beyond two common add-ons, and nothing on your computer beyond Python 3.
@@ -14,12 +15,15 @@ It talks to Kodi's own JSON-RPC API, so there is nothing to install on the Kodi 
 
 | You send | Kodi plays it with |
 |---|---|
-| A YouTube video | the **YouTube** add-on, which starts in a few seconds |
-| Any other URL (Vimeo, Twitch, a direct `.mp4`, a YouTube playlist, …) | the **SendToKodi** add-on, which resolves it with yt-dlp on the Kodi side |
-| A file on your computer | a small built-in HTTP server on your computer, which Kodi streams from |
-| Images: files, or image URLs, even ones without a `.jpg`/`.png` ending, like image-search proxy links | Kodi's picture viewer, where they stay on screen until you leave it; several make a slideshow. Images and videos can't be mixed in one run. |
+| A YouTube video | the **YouTube** add-on, which starts in a few seconds, at the time in the link if it has one (`?t=1m30s`) |
+| A link to a media file or stream (`.mp4`, `.mp3`, `.m3u8`, …, or any URL that serves video or audio) | Kodi itself, without any add-on |
+| Any other URL (Vimeo, Twitch, a YouTube playlist, …) | the **SendToKodi** add-on, which resolves it with yt-dlp on the Kodi side |
+| A file on your computer | a small built-in HTTP server on your computer, which Kodi streams from, subtitles included |
+| A folder | its videos and songs, including those in its subfolders, in natural order (episode 2 before episode 10); or its pictures, if it has neither |
+| Songs | Kodi's music player; with videos among them, the video player |
+| Pictures: files, or image URLs, even ones without a `.jpg`/`.png` ending, like image-search proxy links | Kodi's picture viewer, where they stay on screen until you leave it; several make a slideshow. Pictures can't be mixed with videos or songs in one run. |
 
-The local file server is deliberately narrow. It serves only the files you named, under a random path that changes every run, answers only the Kodi box, and shuts itself down once Kodi has played them, or they have left the queue. Seeking works.
+The local file server is deliberately narrow. It serves only the files you named, and the subtitles next to videos, under a random path that changes every run, answers only the Kodi box, and shuts itself down once Kodi has played them, or they have left the queue. Seeking works.
 
 ## Requirements
 
@@ -61,6 +65,9 @@ send2kodi --host 192.168.1.10 https://youtu.be/jNQXAC9IVRw
 send2kodi URL_OR_FILE ...           # play now, replacing whatever is playing
 send2kodi -q URL_OR_FILE ...        # add to the end of Kodi's queue
 send2kodi -q -C                     # queue the URLs/paths in the clipboard
+ls ~/Videos/*.mkv | send2kodi -     # read them from stdin, one per line
+send2kodi -s 1:02:30 film.mkv       # start at 1h02m30s
+send2kodi --sub film.es.srt URL     # with these subtitles
 send2kodi --bg ~/Videos/film.mkv    # serve the file in the background
 send2kodi --pause                   # toggle pause
 send2kodi --stop
@@ -68,7 +75,30 @@ send2kodi --stop
 
 `-C` reads the clipboard with `wl-paste` on Wayland, or `xclip`/`xsel` on X11, one URL or path per line. Files copied in a file manager work too.
 
-When playing now, `send2kodi` waits until Kodi really starts playing and exits with an error if it has not within a minute. Kodi accepts any link immediately, even one that will never play, so without this a bad link would fail silently on the TV.
+When playing now, `send2kodi` waits until Kodi really starts playing and exits with an error if it has not within a minute. Kodi accepts any link immediately, even one that will never play, so without this a bad link would fail silently on the TV. Live streams count as soon as they play, although they have no length.
+
+`-s/--start` starts the first item at a time: `90`, `1:30`, `1:02:30` or `1h2m30s`. YouTube links start at the time in the link (`?t=…`) by themselves.
+
+URLs that Kodi opens by itself, like `smb://`, `nfs://` or `rtsp://`, are passed on as they are.
+
+### Folders
+
+`send2kodi ~/Videos/Some.Show/` plays the videos in the folder and in the folders inside it, sorted the way people expect: episode 2 before episode 10, `Season 2/` before `Season 10/`. Music folders work the same, in Kodi's music player. Hidden files are skipped.
+
+A folder with videos or songs sends only those, so posters and cover art don't get in the way; one with only pictures makes a slideshow. Each folder's line says what was found:
+
+```
+$ send2kodi ~/Pictures/trip
+/home/you/Pictures/trip: 3 videos, leaving out 120 pictures
+```
+
+To show the pictures of such a folder instead, name them: `send2kodi ~/Pictures/trip/*.jpg`.
+
+### Subtitles
+
+Subtitle files named after a local video, next to it or in a `Subs` folder beside it (`film.srt`, `film.en.srt`, `Subs/film.es.forced.srt`, …), go along with it. Kodi finds them the same way it does next to its own files: they are in its subtitle menu, and turned on or not according to its subtitle language settings.
+
+Any other subtitle file, for a local video or a URL, can be given with `--sub FILE`. Kodi loads it once playback starts, and shows it.
 
 ### Local files
 
@@ -110,6 +140,8 @@ To control more than one Kodi, keep a config per box and pick one with `--config
 **"rejected the login".** Kodi has a web server password set. Put it in `KODI_USER` / `KODI_PASS`.
 
 **URLs work but local files don't.** Kodi cannot reach your computer. Check a firewall is not blocking `SERVE_PORT` (8765 by default), and that `SERVE_IP` (or the autodetected address) is one Kodi can reach.
+
+**The subtitles next to a video don't show.** Their names have to start with the video's (minus its extension). Kodi lists them in its subtitle menu either way, but only turns one on by itself if *Settings → Player → Language → Preferred subtitle language* picks it.
 
 **Security.** Kodi's web control has no password by default, which means anyone on your network can control it, with or without this tool. Setting one in Kodi is a good idea; `send2kodi` supports it.
 
