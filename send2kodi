@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-send2kodi - send URLs and local video files to Kodi.
+send2kodi - send URLs, local videos and images to Kodi.
 
   send2kodi https://youtu.be/jNQXAC9IVRw     # YouTube, or anything yt-dlp knows
   send2kodi ~/Videos/movie.mkv               # a file on this machine
+  send2kodi ~/Pictures/*.jpg                 # images, as a slideshow
   send2kodi -q URL_OR_FILE ...               # append to Kodi's queue
   send2kodi --bg ~/Videos/movie.mkv          # serve in the background
   send2kodi --stop | --pause
@@ -15,6 +16,11 @@ YouTube videos are handed to the YouTube add-on (plugin.video.youtube), which
 starts fastest. Other URLs, and YouTube when that add-on is missing or
 YOUTUBE=ytdlp, go through the SendToKodi add-on (plugin.video.sendtokodi),
 which resolves them with yt-dlp on the Kodi side.
+
+Images (local files, or URLs ending in an image extension) go to Kodi's
+picture viewer instead of the video player, and stay on screen until you
+leave it; several make a slideshow. Images and videos can't be mixed in one
+run.
 
 Local files are served by a small HTTP server that exposes only the files
 given on the command line, under random unguessable paths, answers only the
@@ -32,6 +38,7 @@ import argparse
 import base64
 import functools
 import json
+import mimetypes
 import os
 import re
 import secrets
@@ -65,6 +72,7 @@ DEFAULTS = {
 }
 
 VIDEO_PLAYLIST = 1
+PICTURE_PLAYLIST = 2
 YOUTUBE_ADDON = "plugin.video.youtube"
 SENDTOKODI_ADDON = "plugin.video.sendtokodi"
 
@@ -198,7 +206,8 @@ class FileHandler(BaseHTTPRequestHandler):
             return
         self.send_response(206 if m else 200)
         self.send_header("Accept-Ranges", "bytes")
-        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Type", mimetypes.guess_type(path)[0]
+                         or "application/octet-stream")
         self.send_header("Content-Length", str(end - start + 1))
         if m:
             self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
@@ -260,11 +269,20 @@ def youtube_id(url):
     return vid if re.fullmatch(r"[\w-]{11}", vid) else None
 
 
+def is_image(target):
+    """By extension, for files and URLs alike; that's what Kodi goes by too."""
+    if re.match(r"^https?://", target, re.I):
+        target = urllib.parse.urlparse(target).path
+    return (mimetypes.guess_type(target)[0] or "").startswith("image/")
+
+
 def to_kodi_file(target, server):
     if os.path.isfile(target):
         return server.url_for(target)
     if not re.match(r"^https?://", target, re.I):
         die(f"not a URL or existing file: {target}")
+    if is_image(target):
+        return target  # Kodi's picture viewer fetches these itself
     vid = youtube_id(target)
     if vid and cfg["YOUTUBE"] != "ytdlp" and has_addon(YOUTUBE_ADDON):
         return f"plugin://{YOUTUBE_ADDON}/play/?video_id={vid}"
@@ -276,12 +294,16 @@ def to_kodi_file(target, server):
 
 # -------------------------------------------------------------- lifecycle --
 
-def wait_for_start():
-    """True once Kodi is playing from the video queue, False on timeout."""
+def wait_for_start(playlist):
+    """True once Kodi is playing from the queue, False on timeout."""
     deadline = time.monotonic() + int(cfg["START_TIMEOUT"])
     while time.monotonic() < deadline:
         time.sleep(2)
         for player in rpc("Player.GetActivePlayers"):
+            if playlist == PICTURE_PLAYLIST:
+                if player["type"] == "picture":
+                    return True
+                continue
             props = rpc("Player.GetProperties", {
                 "playerid": player["playerid"],
                 "properties": ["playlistid", "position", "totaltime"]})
@@ -291,11 +313,12 @@ def wait_for_start():
     return False
 
 
-def wait_until_done(urls):
+def wait_until_done(urls, playlist):
     """Serve until playback has started and ended, or our files leave the queue.
 
     Queued files may wait a long time for their turn, so idle time alone
-    doesn't end the run.
+    doesn't end the run. A slideshow fetches each image as it gets to it, so
+    pictures are served until the viewer closes.
     """
     print("Serving local file(s) until playback ends (Ctrl-C to quit)...")
     started = False
@@ -306,7 +329,9 @@ def wait_until_done(urls):
                 started = True
             elif started:
                 return
-            items = rpc("Playlist.GetItems", {"playlistid": VIDEO_PLAYLIST,
+            if started and playlist == PICTURE_PLAYLIST:
+                continue
+            items = rpc("Playlist.GetItems", {"playlistid": playlist,
                                               "properties": ["file"]})
             if not urls & {i.get("file") for i in items.get("items", [])}:
                 return
@@ -355,7 +380,7 @@ def detached():
 
 def main():
     p = argparse.ArgumentParser(
-        description="Send URLs and local video files to Kodi.",
+        description="Send URLs, local videos and images to Kodi.",
         epilog=f"Settings file: {CONFIG_PATH}. Every setting there "
                "(KODI_HOST, KODI_PORT, ...) also works as an environment "
                "variable.")
@@ -397,6 +422,10 @@ def main():
         return
     if not args.targets:
         p.error("nothing to send")
+    images = [is_image(t) for t in args.targets]
+    if any(images) and not all(images):
+        p.error("images and videos can't be sent together")
+    playlist = PICTURE_PLAYLIST if all(images) else VIDEO_PLAYLIST
 
     bg = args.bg if args.bg is not None else truthy(cfg["BACKGROUND"])
     bg = bg and any(os.path.isfile(t) for t in args.targets)
@@ -407,22 +436,22 @@ def main():
     server = Server()
     files = [to_kodi_file(t, server) for t in args.targets]
     if not args.queue:
-        rpc("Playlist.Clear", {"playlistid": VIDEO_PLAYLIST})
+        rpc("Playlist.Clear", {"playlistid": playlist})
     for f in files:
-        rpc("Playlist.Add", {"playlistid": VIDEO_PLAYLIST, "item": {"file": f}})
+        rpc("Playlist.Add", {"playlistid": playlist, "item": {"file": f}})
     if args.queue:
         print(f"Queued {len(files)} item(s).")
     else:
-        rpc("Player.Open", {"item": {"playlistid": VIDEO_PLAYLIST, "position": 0}})
+        rpc("Player.Open", {"item": {"playlistid": playlist, "position": 0}})
         print(f"Sent {len(files)} item(s) to {cfg['KODI_HOST']}, waiting for playback...")
-        if not wait_for_start():
+        if not wait_for_start(playlist):
             die(f"nothing started playing after {cfg['START_TIMEOUT']}s; "
                 "the link may be unsupported or failed to resolve")
         print("Playing.")
     if bg:
         detached()
     if server.httpd is not None:
-        wait_until_done({f for f in files if f.startswith("http://")})
+        wait_until_done({f for f in files if f.startswith("http://")}, playlist)
 
 
 if __name__ == "__main__":

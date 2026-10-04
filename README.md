@@ -1,10 +1,11 @@
 # send2kodi
 
-Send YouTube links, anything else [yt-dlp](https://github.com/yt-dlp/yt-dlp) can play, and video files from your computer to Kodi, from the command line.
+Send YouTube links, anything else [yt-dlp](https://github.com/yt-dlp/yt-dlp) can play, and video or image files from your computer to Kodi, from the command line.
 
 ```sh
 send2kodi https://youtu.be/jNQXAC9IVRw
 send2kodi ~/Videos/holidays.mkv
+send2kodi ~/Pictures/beach/*.jpg
 ```
 
 It talks to Kodi's own JSON-RPC API, so there is nothing to install on the Kodi box beyond two common add-ons, and nothing on your computer beyond Python 3.
@@ -16,6 +17,7 @@ It talks to Kodi's own JSON-RPC API, so there is nothing to install on the Kodi 
 | A YouTube video | the **YouTube** add-on, which starts in a few seconds |
 | Any other URL (Vimeo, Twitch, a direct `.mp4`, a YouTube playlist, …) | the **SendToKodi** add-on, which resolves it with yt-dlp on the Kodi side |
 | A file on your computer | a small built-in HTTP server on your computer, which Kodi streams from |
+| Images (files or URLs ending in `.jpg`, `.png`, …) | Kodi's picture viewer, where they stay on screen until you leave it; several make a slideshow. Images and videos can't be mixed in one run. |
 
 The local file server is deliberately narrow. It serves only the files you named, under a random path that changes every run, answers only the Kodi box, and shuts itself down once Kodi has played them, or they have left the queue. Seeking works.
 
