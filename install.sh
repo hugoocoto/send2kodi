@@ -48,11 +48,13 @@ OPTIONS
 EOF
 }
 
+need_value() { [[ -n "${2:-}" && "$2" != -* ]] || die "$1 needs a value."; }
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --host)      KODI_HOST="${2:-}"; shift 2 ;;
-    --port)      KODI_PORT="${2:-}"; shift 2 ;;
-    --bin-dir)   BIN_DIR="${2:-}";   shift 2 ;;
+    --host)      need_value "$@"; KODI_HOST="$2"; shift 2 ;;
+    --port)      need_value "$@"; KODI_PORT="$2"; shift 2 ;;
+    --bin-dir)   need_value "$@"; BIN_DIR="$2";   shift 2 ;;
     -y|--yes)    ASSUME_YES=1;       shift ;;
     --uninstall) UNINSTALL=1;        shift ;;
     -h|--help)   usage; exit 0 ;;
@@ -87,6 +89,7 @@ fi
 command -v python3 >/dev/null 2>&1 || die "send2kodi needs python3."
 python3 -c 'import sys; sys.exit(sys.version_info < (3, 9))' ||
   die "send2kodi needs Python 3.9 or newer."
+[[ "$KODI_PORT" =~ ^[0-9]+$ ]] || die "the port has to be a number, not '$KODI_PORT'."
 
 # ------------------------------------------------------------ the Kodi box --
 valid_host() {

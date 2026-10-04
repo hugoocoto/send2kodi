@@ -1,5 +1,7 @@
 # send2kodi
 
+[![tests](https://github.com/hugoocoto/send2kodi/actions/workflows/tests.yml/badge.svg)](https://github.com/hugoocoto/send2kodi/actions/workflows/tests.yml)
+
 Send YouTube links, anything else [yt-dlp](https://github.com/yt-dlp/yt-dlp) can play, links to media files and streams, and the videos, music and pictures on your computer to Kodi, from the command line.
 
 ```sh
@@ -31,8 +33,9 @@ The local file server is deliberately narrow. It serves only the files you named
 
 **Kodi:**
 
+- Kodi 18 (Leia) or newer; `--sub` needs Kodi 19. Developed and tested on Kodi 21 (Omega).
 - *Settings → Services → Control → Allow remote control via HTTP* enabled.
-- The [SendToKodi](https://github.com/firsttris/plugin.video.sendtokodi) add-on, for anything that is not YouTube.
+- The [SendToKodi](https://github.com/firsttris/plugin.video.sendtokodi) add-on, for links that are neither YouTube nor media files.
 - The YouTube add-on (in the official Kodi repository), for YouTube. Without it, YouTube links go through SendToKodi too, which works but is slower to start.
 
 ## Install
@@ -139,11 +142,23 @@ To control more than one Kodi, keep a config per box and pick one with `--config
 
 **"rejected the login".** Kodi has a web server password set. Put it in `KODI_USER` / `KODI_PASS`.
 
-**URLs work but local files don't.** Kodi cannot reach your computer. Check a firewall is not blocking `SERVE_PORT` (8765 by default), and that `SERVE_IP` (or the autodetected address) is one Kodi can reach.
+**URLs work but local files don't.** Kodi cannot reach your computer, and `send2kodi` says so: "Kodi never reached this computer". Check a firewall is not blocking `SERVE_PORT` (8765 by default), and that `SERVE_IP` (or the autodetected address) is one Kodi can reach.
 
 **The subtitles next to a video don't show.** Their names have to start with the video's (minus its extension). Kodi lists them in its subtitle menu either way, but only turns one on by itself if *Settings → Player → Language → Preferred subtitle language* picks it.
 
 **Security.** Kodi's web control has no password by default, which means anyone on your network can control it, with or without this tool. Setting one in Kodi is a good idea; `send2kodi` supports it.
+
+## Tests
+
+`tests/` runs the real script against a mock Kodi that behaves like Kodi 21 does over JSON-RPC and HTTP: how it looks for the subtitles next to a video, drops PNGs added to a slideshow, adds to playlists a moment later, and so on. Nothing plays on a TV, and nothing goes to the internet.
+
+```sh
+python3 -m unittest discover tests     # no dependencies; a few minutes
+pip install pytest pytest-xdist
+pytest -n auto tests                   # the same, in under a minute
+```
+
+GitHub Actions runs them on Python 3.9 and 3.14 for every push to `main` and every pull request.
 
 ## License
 

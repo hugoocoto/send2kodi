@@ -242,6 +242,7 @@ class FileHandler(BaseHTTPRequestHandler):
 
     folders = {}     # "/<token>/<n>/" -> {name: absolute path}
     fetched = set()  # paths of the files Kodi has asked for
+    callers = set()  # addresses anything was asked from, Kodi's or not
 
     def log_message(self, fmt, *args):
         pass
@@ -253,6 +254,7 @@ class FileHandler(BaseHTTPRequestHandler):
         self.serve(body=True)
 
     def serve(self, body):
+        self.callers.add(self.client_address[0])
         asked = urllib.parse.unquote(self.path, errors="surrogateescape")
         folder, _, name = asked.rpartition("/")
         files = self.folders.get(folder + "/")
@@ -317,12 +319,19 @@ class Server:
         self.extras = 0  # subtitles served along with videos
 
     def start(self):
-        ip = local_ip()
         try:
-            self.httpd = ThreadingHTTPServer(
-                (ip, int(cfg["SERVE_PORT"])), FileHandler)
-        except OSError:  # port taken (e.g. another send2kodi): pick any
-            self.httpd = ThreadingHTTPServer((ip, 0), FileHandler)
+            ip = local_ip()
+            try:
+                self.httpd = ThreadingHTTPServer(
+                    (ip, int(cfg["SERVE_PORT"])), FileHandler)
+            except OSError:  # port taken (e.g. another send2kodi): pick any
+                self.httpd = ThreadingHTTPServer((ip, 0), FileHandler)
+        except OSError as e:
+            if cfg["SERVE_IP"]:
+                die(f"cannot serve files on SERVE_IP={cfg['SERVE_IP']} "
+                    f"({e.strerror or e}).\n  It has to be an address of this "
+                    "computer; without it, send2kodi finds one itself.")
+            die(f"cannot serve files to Kodi at {cfg['KODI_HOST']} ({e.strerror or e})")
         self.httpd.daemon_threads = True
         threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
         self.prefix = f"http://{ip}:{self.httpd.server_port}/{self.token}/"
@@ -750,6 +759,26 @@ def wait_for_start(playlist, ours):
     return None
 
 
+def not_started(server, local):
+    """Why nothing started playing, as far as can be told from here; local is
+    whether the first item is served from here."""
+    callers = FileHandler.callers
+    if not local:
+        why = "the link may be unsupported or failed to resolve"
+    elif kodi_ip() in callers:
+        why = ("Kodi reached this computer but did not start playing; it may "
+               "be in a format Kodi can't play")
+    elif callers:
+        why = (f"requests came from {', '.join(sorted(callers))}, but files "
+               f"are only served to Kodi's address, {kodi_ip()}")
+    else:
+        ip, port = server.httpd.server_address[:2]
+        why = (f"Kodi never reached this computer.\n  Is a firewall blocking "
+               f"port {port}, or does Kodi reach this computer at another "
+               f"address than {ip} (SERVE_IP)?")
+    return f"nothing started playing after {cfg['START_TIMEOUT']}s; {why}"
+
+
 def seek(player, s):
     """Jump to s seconds into what the player is playing."""
     try:
@@ -901,6 +930,9 @@ def main():
         cfg["KODI_PORT"] = args.port
     if args.ytdlp:
         cfg["YOUTUBE"] = "ytdlp"
+    for key in ("KODI_PORT", "SERVE_PORT", "START_TIMEOUT"):
+        if not cfg[key].isdigit():
+            die(f"{key} has to be a number, not '{cfg[key]}'")
     if not cfg["KODI_HOST"]:
         die(f"no Kodi configured. Run the installer, pass --host, or set "
             f"KODI_HOST in {args.config}")
@@ -970,8 +1002,7 @@ def main():
               "waiting for playback...")
         player = wait_for_start(playlist, ours)
         if player is None:
-            die(f"nothing started playing after {cfg['START_TIMEOUT']}s; "
-                "the link may be unsupported or failed to resolve")
+            die(not_started(server, slideshow or routes[0] in ("serve", "download")))
         print("Playing.")
         if starts[0] and routes[0] != "youtube":  # that add-on seeks by itself
             seek(player, starts[0])
