@@ -17,7 +17,7 @@ It talks to Kodi's own JSON-RPC API, so there is nothing to install on the Kodi 
 | A YouTube video | the **YouTube** add-on, which starts in a few seconds |
 | Any other URL (Vimeo, Twitch, a direct `.mp4`, a YouTube playlist, …) | the **SendToKodi** add-on, which resolves it with yt-dlp on the Kodi side |
 | A file on your computer | a small built-in HTTP server on your computer, which Kodi streams from |
-| Images (files or URLs ending in `.jpg`, `.png`, …) | Kodi's picture viewer, where they stay on screen until you leave it; several make a slideshow. Images and videos can't be mixed in one run. |
+| Images: files, or image URLs, even ones without a `.jpg`/`.png` ending, like image-search proxy links | Kodi's picture viewer, where they stay on screen until you leave it; several make a slideshow. Images and videos can't be mixed in one run. |
 
 The local file server is deliberately narrow. It serves only the files you named, under a random path that changes every run, answers only the Kodi box, and shuts itself down once Kodi has played them, or they have left the queue. Seeking works.
 

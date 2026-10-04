@@ -275,11 +275,64 @@ def youtube_id(url):
     return vid if re.fullmatch(r"[\w-]{11}", vid) else None
 
 
+USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) send2kodi/" + VERSION
+
+
+@functools.cache
+def tempdir():
+    """Removed when send2kodi exits."""
+    path = tempfile.mkdtemp(prefix="send2kodi-")
+    atexit.register(shutil.rmtree, path, True)
+    return path
+
+
+@functools.cache
+def remote_type(url):
+    """The Content-Type a URL serves, or "" if it can't be found out."""
+    for method, headers in (("HEAD", {}), ("GET", {"Range": "bytes=0-0"})):
+        req = urllib.request.Request(url, method=method, headers={
+            "User-Agent": USER_AGENT, **headers})
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                return r.headers.get_content_type()
+        except (OSError, ValueError):
+            continue  # some servers refuse HEAD
+    return ""
+
+
+def is_url(target):
+    return re.match(r"^https?://", target, re.I) is not None
+
+
 def is_image(target):
-    """By extension, for files and URLs alike; that's what Kodi goes by too."""
-    if re.match(r"^https?://", target, re.I):
-        target = urllib.parse.urlparse(target).path
-    return (mimetypes.guess_type(target)[0] or "").startswith("image/")
+    """By extension, which is what Kodi goes by; for a URL whose extension
+    says nothing (e.g. an image proxy's /iu/?u=...), by what it serves."""
+    kind = mimetypes.guess_type(
+        urllib.parse.urlparse(target).path if is_url(target) else target)[0]
+    if kind is None and is_url(target) and not youtube_id(target):
+        kind = remote_type(target)
+    return (kind or "").startswith("image/")
+
+
+def served_locally(target):
+    """Local files, and images Kodi wouldn't recognise from their URL."""
+    return os.path.isfile(target) or (
+        is_image(target)
+        and not mimetypes.guess_type(urllib.parse.urlparse(target).path)[0])
+
+
+def download_image(url):
+    """A local copy, named with the right extension so Kodi knows it."""
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            ext = mimetypes.guess_extension(r.headers.get_content_type()) or ".jpg"
+            path = os.path.join(tempdir(), f"image{len(os.listdir(tempdir()))}{ext}")
+            with open(path, "wb") as f:
+                shutil.copyfileobj(r, f)
+    except OSError as e:
+        die(f"cannot download {url}: {e}")
+    return path
 
 
 # Clipboard formats, best first. A file manager offers text/uri-list; a
@@ -328,9 +381,7 @@ def clipboard():
             data = read_clipboard(read_cmd + [mime]).decode(errors="replace")
         elif image:
             ext = mimetypes.guess_extension(image) or ".png"
-            tmp = tempfile.mkdtemp(prefix="send2kodi-")
-            atexit.register(shutil.rmtree, tmp, True)
-            path = os.path.join(tmp, "clipboard" + ext)
+            path = os.path.join(tempdir(), "clipboard" + ext)
             with open(path, "wb") as f:
                 f.write(read_clipboard(read_cmd + [image]))
             return [path]
@@ -356,8 +407,10 @@ def clipboard():
 def to_kodi_file(target, server):
     if os.path.isfile(target):
         return server.url_for(target)
-    if not re.match(r"^https?://", target, re.I):
+    if not is_url(target):
         die(f"not a URL or existing file: {target}")
+    if served_locally(target):
+        return server.url_for(download_image(target))
     if is_image(target):
         return target  # Kodi's picture viewer fetches these itself
     vid = youtube_id(target)
@@ -399,18 +452,27 @@ def wait_until_done(urls, playlist):
 
     Queued files may wait a long time for their turn, so idle time alone
     doesn't end the run. A slideshow fetches each image as it gets to it, so
-    pictures are served until the viewer closes.
+    pictures are served until the viewer moves off them: closed, or showing
+    something someone else sent.
     """
     print("Serving local file(s) until playback ends (Ctrl-C to quit)...")
     started = False
     try:
         while True:
             time.sleep(5)
-            if rpc("Player.GetActivePlayers"):
+            players = rpc("Player.GetActivePlayers")
+            if players:
                 started = True
             elif started:
                 return
             if started and playlist == PICTURE_PLAYLIST:
+                viewer = [p for p in players if p["type"] == "picture"]
+                if not viewer:
+                    return
+                shown = rpc("Player.GetItem", {"playerid": viewer[0]["playerid"],
+                                               "properties": ["file"]})
+                if shown["item"].get("file") not in urls:
+                    return
                 continue
             items = rpc("Playlist.GetItems", {"playlistid": playlist,
                                               "properties": ["file"]})
@@ -521,7 +583,7 @@ def main():
             "Leave it, or send them without -q to replace it.")
 
     bg = args.bg if args.bg is not None else truthy(cfg["BACKGROUND"])
-    bg = bg and any(os.path.isfile(t) for t in args.targets)
+    bg = bg and any(served_locally(t) for t in args.targets)
     if bg:
         background()
         print(f"Serving local file(s) in the background (pid {os.getpid()}).")
@@ -555,8 +617,15 @@ def main():
     if bg:
         detached()
     if server.httpd is not None:
-        wait_until_done({f for f in files if f.startswith("http://")}, playlist)
+        # A slideshow may mix in remote pictures; it's still ours meanwhile.
+        ours = set(files) if playlist == PICTURE_PLAYLIST else {
+            f for f in files if f.startswith("http://")}
+        wait_until_done(ours, playlist)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print(file=sys.stderr)  # end the line the terminal's ^C is on
+        sys.exit(130)
