@@ -36,6 +36,7 @@ https://github.com/hugoocoto/send2kodi
 """
 
 import argparse
+import atexit
 import base64
 import functools
 import json
@@ -44,9 +45,11 @@ import os
 import re
 import secrets
 import shutil
+import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -279,25 +282,68 @@ def is_image(target):
     return (mimetypes.guess_type(target)[0] or "").startswith("image/")
 
 
-def clipboard():
-    """Targets in the clipboard, one per line; file:// URIs become paths."""
-    if os.environ.get("WAYLAND_DISPLAY"):
-        tools = [["wl-paste", "--no-newline"]]
-    else:
-        tools = []
-    tools += [["xclip", "-o", "-selection", "clipboard"], ["xsel", "-ob"]]
-    for cmd in tools:
-        if shutil.which(cmd[0]):
-            break
-    else:
-        die("reading the clipboard needs wl-clipboard (Wayland), "
-            "or xclip or xsel (X11)")
-    r = subprocess.run(cmd, capture_output=True, text=True)
+# Clipboard formats, best first. A file manager offers text/uri-list; a
+# browser's "Copy image" offers no text at all, only the picture and the
+# image's address as text/x-moz-url (UTF-16, URL then title).
+CLIP_TEXT = ["text/uri-list", "text/plain;charset=utf-8", "text/plain",
+             "UTF8_STRING", "STRING", "TEXT"]
+CLIP_MOZ_URL = "text/x-moz-url"
+
+
+def clipboard_tool():
+    """argv prefixes to list and to read the clipboard, or None to list."""
+    if os.environ.get("WAYLAND_DISPLAY") and shutil.which("wl-paste"):
+        return ["wl-paste", "--list-types"], ["wl-paste", "--no-newline", "--type"]
+    if shutil.which("xclip"):
+        base = ["xclip", "-o", "-selection", "clipboard", "-t"]
+        return base + ["TARGETS"], base
+    if shutil.which("xsel"):
+        return None, ["xsel", "-ob"]  # text only
+    die("reading the clipboard needs wl-clipboard (Wayland), "
+        "or xclip or xsel (X11)")
+
+
+def read_clipboard(cmd):
+    r = subprocess.run(cmd, capture_output=True)
     if r.returncode != 0:
-        die(f"{cmd[0]}: {r.stderr.strip() or 'cannot read the clipboard'}")
+        die(f"{cmd[0]}: {r.stderr.decode(errors='replace').strip() or 'cannot read the clipboard'}")
+    return r.stdout
+
+
+def clipboard():
+    """Targets in the clipboard: URLs or paths one per line, or a copied image.
+
+    file:// URIs become paths. Image data is saved to a temporary file, which
+    is removed when send2kodi exits.
+    """
+    list_cmd, read_cmd = clipboard_tool()
+    if list_cmd is None:
+        types = []
+        data = read_clipboard(read_cmd).decode(errors="replace")
+    else:
+        types = read_clipboard(list_cmd).decode(errors="replace").split()
+        mime = next((t for t in CLIP_TEXT if t in types), None)
+        image = next((t for t in types if t.startswith("image/")), None)
+        if mime:
+            data = read_clipboard(read_cmd + [mime]).decode(errors="replace")
+        elif image:
+            ext = mimetypes.guess_extension(image) or ".png"
+            tmp = tempfile.mkdtemp(prefix="send2kodi-")
+            atexit.register(shutil.rmtree, tmp, True)
+            path = os.path.join(tmp, "clipboard" + ext)
+            with open(path, "wb") as f:
+                f.write(read_clipboard(read_cmd + [image]))
+            return [path]
+        elif CLIP_MOZ_URL in types:
+            raw = read_clipboard(read_cmd + [CLIP_MOZ_URL])
+            data = raw.decode("utf-16" if b"\0" in raw else "utf-8",
+                              errors="replace").split("\n")[0]
+        else:
+            die("the clipboard holds no text or image"
+                + (f" (it has: {', '.join(types)})" if types else ""))
     targets = []
-    for line in r.stdout.splitlines():
-        line = line.strip()
+    for line in data.splitlines():
+        line = line.strip().strip("\0")
         if line.lower().startswith("file://"):
             line = urllib.parse.unquote(urllib.parse.urlparse(line).path)
         if line and not line.startswith("#"):  # text/uri-list comments
@@ -324,6 +370,10 @@ def to_kodi_file(target, server):
 
 
 # -------------------------------------------------------------- lifecycle --
+
+def playlist_size(playlist):
+    return rpc("Playlist.GetItems", {"playlistid": playlist})["limits"]["total"]
+
 
 def wait_for_start(playlist):
     """True once Kodi is playing from the queue, False on timeout."""
@@ -436,6 +486,8 @@ def main():
                    help="settings file (default: %(default)s)")
     p.add_argument("--version", action="version", version=f"send2kodi {VERSION}")
     args = p.parse_args()
+    # Exit normally on kill too, so temporary files are cleaned up.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
 
     cfg.update(read_config(args.config))
     cfg.update({k: os.environ[k] for k in DEFAULTS if k in os.environ})
@@ -462,6 +514,11 @@ def main():
     if any(images) and not all(images):
         p.error("images and videos can't be sent together")
     playlist = PICTURE_PLAYLIST if all(images) else VIDEO_PLAYLIST
+    # Kodi answers OK to adding pictures to an open slideshow, but drops them.
+    if args.queue and playlist == PICTURE_PLAYLIST and any(
+            p["type"] == "picture" for p in rpc("Player.GetActivePlayers")):
+        die("Kodi can't add pictures to a slideshow that is already showing. "
+            "Leave it, or send them without -q to replace it.")
 
     bg = args.bg if args.bg is not None else truthy(cfg["BACKGROUND"])
     bg = bg and any(os.path.isfile(t) for t in args.targets)
@@ -471,14 +528,25 @@ def main():
 
     server = Server()
     files = [to_kodi_file(t, server) for t in args.targets]
-    if not args.queue:
-        rpc("Playlist.Clear", {"playlistid": playlist})
-    for f in files:
-        rpc("Playlist.Add", {"playlistid": playlist, "item": {"file": f}})
+    if playlist == PICTURE_PLAYLIST and len(files) == 1 and not args.queue:
+        # Straight to the viewer: Kodi drops PNGs added to a slideshow.
+        rpc("Player.Open", {"item": {"file": files[0]}})
+    else:
+        if not args.queue:
+            rpc("Playlist.Clear", {"playlistid": playlist})
+        before = playlist_size(playlist)
+        for f in files:
+            rpc("Playlist.Add", {"playlistid": playlist, "item": {"file": f}})
+        added = playlist_size(playlist) - before
+        if added < len(files):
+            die(f"Kodi accepted only {added} of {len(files)} item(s)"
+                + (". It drops PNGs from slideshows; send those one at a time "
+                   "without -q." if playlist == PICTURE_PLAYLIST else ""))
+        if not args.queue:
+            rpc("Player.Open", {"item": {"playlistid": playlist, "position": 0}})
     if args.queue:
         print(f"Queued {len(files)} item(s).")
     else:
-        rpc("Player.Open", {"item": {"playlistid": playlist, "position": 0}})
         print(f"Sent {len(files)} item(s) to {cfg['KODI_HOST']}, waiting for playback...")
         if not wait_for_start(playlist):
             die(f"nothing started playing after {cfg['START_TIMEOUT']}s; "
